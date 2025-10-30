@@ -93,19 +93,32 @@ func (cmd *CommandCmd) Run(ctx context.Context, options *options.Options, log lo
 			"22",
 			"--local-host-port=localhost:" + port,
 			"--zone=" + *instance.Zone,
+			"--project=" + options.Project,
+			"--verbosity=warning",
 		}...)
 
+		// capture output for debugging
+		gcloudIAPcommand.Stderr = os.Stderr
+		gcloudIAPcommand.Stdout = os.Stdout
+
 		// open tunnel in background
+		log.Infof("Starting IAP tunnel for instance %s on port %s...", *instance.Name, port)
 		if err = gcloudIAPcommand.Start(); err != nil {
-			return fmt.Errorf("start tunnel: %w", err)
+			return fmt.Errorf("start IAP tunnel: %w", err)
 		}
 		defer func() {
-			err = gcloudIAPcommand.Process.Kill()
+			if gcloudIAPcommand.Process != nil {
+				_ = gcloudIAPcommand.Process.Kill()
+			}
 		}()
 
 		timeoutCtx, cancelFn := context.WithTimeout(ctx, 30*time.Second)
 		defer cancelFn()
-		waitForPort(timeoutCtx, port)
+		log.Infof("Waiting for IAP tunnel on port %s...", port)
+		if !waitForPort(timeoutCtx, port) {
+			return fmt.Errorf("IAP tunnel failed to establish on port %s within 30 seconds", port)
+		}
+		log.Infof("IAP tunnel established successfully")
 	}
 
 	sshClient, err := ssh.NewSSHClient("devpod", target+":"+port, privateKey)
@@ -128,16 +141,16 @@ func findAvailablePort() (string, error) {
 	return strconv.Itoa(l.Addr().(*net.TCPAddr).Port), nil
 }
 
-func waitForPort(ctx context.Context, port string) {
+func waitForPort(ctx context.Context, port string) bool {
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return false
 		default:
 			l, err := net.Listen("tcp", "localhost:"+port)
 			if err != nil {
-				// port is taken
-				return
+				// port is taken (tunnel is ready)
+				return true
 			}
 			_ = l.Close()
 			time.Sleep(1 * time.Second)
