@@ -115,6 +115,20 @@ if ! id -u devpod > /dev/null 2>&1; then
   # Allow sudo without password for DevPod operations
   echo "devpod ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/devpod
   chmod 0440 /etc/sudoers.d/devpod
+
+  # Setup SSH authorized_keys from metadata
+  # Google's guest-agent doesn't populate this for IAP connections
+  mkdir -p /home/devpod/.ssh
+  chmod 700 /home/devpod/.ssh
+
+  # Extract devpod's public key from instance metadata
+  curl -s "http://metadata.google.internal/computeMetadata/v1/instance/attributes/ssh-keys" \
+    -H "Metadata-Flavor: Google" | \
+    grep "^devpod:" | \
+    sed 's/^devpod://' > /home/devpod/.ssh/authorized_keys
+
+  chmod 600 /home/devpod/.ssh/authorized_keys
+  chown -R devpod:devpod /home/devpod/.ssh
 fi
 `
 		metadataItems = append(metadataItems, &computepb.Items{
