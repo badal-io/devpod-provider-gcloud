@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -72,54 +73,34 @@ func (cmd *CommandCmd) Run(ctx context.Context, options *options.Options, log lo
 		return fmt.Errorf("instance %s doesn't have an external nat ip", options.MachineID)
 	}
 
-	var target string
-	var port string
-	// get external address
-	if options.PublicIP {
-		target = *instance.NetworkInterfaces[0].AccessConfigs[0].NatIP
-		port = "22"
-	} else {
-		target = "localhost"
+	// Use SSH with ProxyCommand for IAP when no public IP
+	if !options.PublicIP {
+		// Path to SSH config file created during machine setup
+		sshConfigPath := filepath.Join(options.MachineFolder, "ssh_config")
 
-		port, err = findAvailablePort()
-		if err != nil {
-			return err
+		// Use system ssh command with our config file
+		// This leverages the ProxyCommand configured during create
+		sshArgs := []string{
+			"-F", sshConfigPath,  // Use our SSH config with ProxyCommand
+			options.MachineID,    // Host (configured in ssh_config)
+			command,              // Command to execute
 		}
 
-		gcloudIAPcommand := exec.Command("gcloud", []string{
-			"compute",
-			"start-iap-tunnel",
-			*instance.Name,
-			"22",
-			"--local-host-port=localhost:" + port,
-			"--zone=" + *instance.Zone,
-			"--project=" + options.Project,
-			"--verbosity=warning",
-		}...)
+		sshCmd := exec.CommandContext(ctx, "ssh", sshArgs...)
+		sshCmd.Stdin = os.Stdin
+		sshCmd.Stdout = os.Stdout
+		sshCmd.Stderr = os.Stderr
 
-		// capture output for debugging
-		gcloudIAPcommand.Stderr = os.Stderr
-		gcloudIAPcommand.Stdout = os.Stdout
-
-		// open tunnel in background
-		log.Infof("Starting IAP tunnel for instance %s on port %s...", *instance.Name, port)
-		if err = gcloudIAPcommand.Start(); err != nil {
-			return fmt.Errorf("start IAP tunnel: %w", err)
+		if err := sshCmd.Run(); err != nil {
+			return fmt.Errorf("ssh via IAP ProxyCommand: %w", err)
 		}
-		defer func() {
-			if gcloudIAPcommand.Process != nil {
-				_ = gcloudIAPcommand.Process.Kill()
-			}
-		}()
 
-		timeoutCtx, cancelFn := context.WithTimeout(ctx, 30*time.Second)
-		defer cancelFn()
-		log.Infof("Waiting for IAP tunnel on port %s...", port)
-		if !waitForPort(timeoutCtx, port) {
-			return fmt.Errorf("IAP tunnel failed to establish on port %s within 30 seconds", port)
-		}
-		log.Infof("IAP tunnel established successfully")
+		return nil
 	}
+
+	// For instances with public IP, use standard SSH
+	target := *instance.NetworkInterfaces[0].AccessConfigs[0].NatIP
+	port := "22"
 
 	sshClient, err := ssh.NewSSHClient("devpod", target+":"+port, privateKey)
 	if err != nil {

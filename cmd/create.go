@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -53,7 +55,17 @@ func (cmd *CreateCmd) Run(ctx context.Context, options *options.Options, log log
 		return err
 	}
 
-	return client.Create(ctx, instance)
+	err = client.Create(ctx, instance)
+	if err != nil {
+		return err
+	}
+
+	// Configure SSH with ProxyCommand for IAP if not using public IP
+	if !options.PublicIP {
+		return configureSSHForIAP(options)
+	}
+
+	return nil
 }
 
 func buildInstance(options *options.Options) (*computepb.Instance, error) {
@@ -84,6 +96,33 @@ func buildInstance(options *options.Options) (*computepb.Instance, error) {
 		}
 	}
 
+	// prepare metadata items
+	metadataItems := []*computepb.Items{
+		{
+			Key:   ptr.Ptr("ssh-keys"),
+			Value: ptr.Ptr("devpod:" + string(publicKey)),
+		},
+	}
+
+	// Add startup script for IAP (no public IP) to create devpod user
+	// Google's guest-agent doesn't auto-create users from metadata when connecting via IAP
+	if !options.PublicIP {
+		startupScript := `#!/bin/bash
+# Create devpod user if it doesn't exist (required for IAP SSH)
+if ! id -u devpod > /dev/null 2>&1; then
+  useradd -m -s /bin/bash devpod
+  usermod -aG sudo devpod
+  # Allow sudo without password for DevPod operations
+  echo "devpod ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/devpod
+  chmod 0440 /etc/sudoers.d/devpod
+fi
+`
+		metadataItems = append(metadataItems, &computepb.Items{
+			Key:   ptr.Ptr("startup-script"),
+			Value: ptr.Ptr(startupScript),
+		})
+	}
+
 	// generate instance object
 	instance := &computepb.Instance{
 		Scheduling: &computepb.Scheduling{
@@ -91,12 +130,7 @@ func buildInstance(options *options.Options) (*computepb.Instance, error) {
 			OnHostMaintenance: ptr.Ptr(getMaintenancePolicy(options.MachineType)),
 		},
 		Metadata: &computepb.Metadata{
-			Items: []*computepb.Items{
-				{
-					Key:   ptr.Ptr("ssh-keys"),
-					Value: ptr.Ptr("devpod:" + string(publicKey)),
-				},
-			},
+			Items: metadataItems,
 		},
 		MachineType: ptr.Ptr(fmt.Sprintf("projects/%s/zones/%s/machineTypes/%s", options.Project, options.Zone, options.MachineType)),
 		Disks: []*computepb.AttachedDisk{
@@ -211,4 +245,36 @@ func getMaintenancePolicy(machineType string) string {
 	}
 
 	return "MIGRATE"
+}
+
+// configureSSHForIAP creates an SSH config file with ProxyCommand for IAP tunneling
+func configureSSHForIAP(options *options.Options) error {
+	// SSH config will be in the machine folder
+	sshConfigPath := filepath.Join(options.MachineFolder, "ssh_config")
+
+	// Create SSH config content with ProxyCommand for IAP
+	sshConfig := fmt.Sprintf(`# DevPod GCP Provider IAP SSH Configuration
+Host %s
+    HostName %s
+    User devpod
+    IdentityFile %s
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    ProxyCommand gcloud compute start-iap-tunnel %%h %%p --listen-on-stdin --project=%s --zone=%s --verbosity=warning
+    ServerAliveInterval 30
+    ServerAliveCountMax 3
+`,
+		options.MachineID,            // Host
+		options.MachineID,            // HostName (will be resolved via ProxyCommand)
+		filepath.Join(options.MachineFolder, "id_devpod_rsa"), // IdentityFile - DevPod's key naming
+		options.Project,              // GCP Project
+		options.Zone,                 // GCP Zone
+	)
+
+	// Write SSH config file
+	if err := os.WriteFile(sshConfigPath, []byte(sshConfig), 0600); err != nil {
+		return fmt.Errorf("write ssh config: %w", err)
+	}
+
+	return nil
 }
