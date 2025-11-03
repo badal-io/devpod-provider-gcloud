@@ -1,67 +1,95 @@
 # IAP SSH Connection Solution - DevPod GCP Provider
 
+**Repository**: https://github.com/badal-io/devpod-provider-gcloud
+
 ## ✅ Solution Implemented
 
-We've successfully implemented Identity-Aware Proxy (IAP) SSH support for the DevPod GCP provider using Google's recommended `--tunnel-through-iap` approach.
+We've successfully implemented Identity-Aware Proxy (IAP) SSH support for the DevPod GCP provider using SSH ProxyCommand with `gcloud compute start-iap-tunnel` for persistent connections.
 
 ## 🎯 What Was Changed
 
-### File: `cmd/command.go`
+### Implementation Approach: SSH ProxyCommand
 
-**Replaced manual tunnel management** with Google's integrated IAP SSH:
+After testing various approaches, we implemented IAP support using SSH ProxyCommand, which provides:
+- **Persistent SSH sessions** (required for DevPod agent injection)
+- **Clean stdout/stderr** (no tunnel startup messages)
+- **Automatic tunnel lifecycle management** by SSH client
 
-```go
-// Old approach: Manual tunnel + SSH client
-gcloud compute start-iap-tunnel + localhost:PORT connection
+### Files Modified:
 
-// New approach: Integrated gcloud compute ssh
-gcloud compute ssh INSTANCE --tunnel-through-iap
+#### 1. `cmd/create.go` - VM Creation & SSH Configuration
+- Added `configureSSHForIAP()` function to create SSH config with ProxyCommand
+- Added startup script to create devpod user and populate authorized_keys
+- Added Cloud NAT validation to ensure internet access for private VMs
+
+#### 2. `pkg/gcloud/gcloud.go` - Cloud NAT Detection
+- Added `CheckCloudNAT()` method to validate network configuration
+- Prevents workspace creation failures due to missing internet access
+
+### SSH Configuration (ProxyCommand)
+
+```
+Host MACHINE_ID
+    HostName MACHINE_ID
+    User devpod
+    IdentityFile /path/to/id_devpod_rsa
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    ProxyCommand gcloud compute start-iap-tunnel %h %p --listen-on-stdin --project=PROJECT --zone=ZONE --verbosity=warning
+    ServerAliveInterval 30
+    ServerAliveCountMax 3
 ```
 
-### Key Changes (Lines 78-119)
-
-```go
-if !options.PublicIP {
-    // Use gcloud compute ssh with IAP tunnel
-    gcloudArgs := []string{
-        "compute",
-        "ssh",
-        *instance.Name,
-        "--tunnel-through-iap",
-        "--zone=" + *instance.Zone,
-        "--project=" + options.Project,
-        "--command=" + command,
-        "--quiet",
-    }
-
-    gcloudCmd := exec.CommandContext(ctx, "gcloud", gcloudArgs...)
-    gcloudCmd.Stdin = os.Stdin
-    gcloudCmd.Stdout = os.Stdout
-    gcloudCmd.Stderr = os.Stderr
-
-    return gcloudCmd.Run()
-}
-```
+This configuration allows SSH to manage the IAP tunnel automatically, providing persistent connections required by DevPod.
 
 ## ✅ Verification - IAP Works!
 
-Manual test confirmed IAP is functional:
+Testing confirmed full IAP functionality with:
+- ✅ SSH connections through ProxyCommand work correctly
+- ✅ DevPod agent injection succeeds over persistent SSH sessions
+- ✅ Repository cloning works through the tunnel
+- ✅ Docker container builds complete successfully
+- ✅ `devpod status` and `devpod ssh` commands function properly
 
-```bash
-$ gcloud compute ssh devpod-turbo-flow-fba4f \
-  --zone=northamerica-northeast1-a \
-  --project=prj-np-devex-backstage-z3brs \
-  --tunnel-through-iap \
-  --command="echo IAP_TEST_SUCCESS"
+### Cloud NAT Validation
 
-Output: IAP_TEST_SUCCESS
+The provider automatically validates Cloud NAT configuration before creating VMs. If Cloud NAT is not configured, you'll receive a helpful error message with exact `gcloud` commands to enable it:
+
+```
+Cloud NAT is not configured for subnet 'your-subnet' in region 'us-central1'.
+
+DevPod instances without public IPs require Cloud NAT for outbound internet access
+to download the DevPod agent and dependencies.
+
+To enable Cloud NAT, run the following commands:
+  [exact gcloud commands with your project/region/network values]
 ```
 
 ## 📋 Prerequisites
 
 For IAP to work, your GCP project must have:
 
-### 1. Firewall Rule
+### 1. Cloud NAT Configuration
+**Required for internet access:**
+```bash
+# Create a Cloud Router (if one doesn't exist)
+gcloud compute routers create devpod-nat-router \
+  --project=YOUR_PROJECT \
+  --region=YOUR_REGION \
+  --network=YOUR_NETWORK
+
+# Create Cloud NAT configuration
+gcloud compute routers nats create devpod-nat-config \
+  --router=devpod-nat-router \
+  --region=YOUR_REGION \
+  --nat-all-subnet-ip-ranges \
+  --auto-allocate-nat-external-ips \
+  --project=YOUR_PROJECT
+```
+
+The provider will automatically check for Cloud NAT and provide these commands if it's missing.
+
+### 2. Firewall Rule
 ```bash
 gcloud compute firewall-rules create allow-iap-ssh \
   --direction=INGRESS \
@@ -70,12 +98,12 @@ gcloud compute firewall-rules create allow-iap-ssh \
   --source-ranges=35.235.240.0/20
 ```
 
-### 2. IAM Permissions
+### 3. IAM Permissions
 User/service account needs:
 - `roles/iap.tunnelResourceAccessor` (IAP-Secured Tunnel User)
 - `roles/compute.instanceAdmin` or equivalent
 
-### 3. IAP API
+### 4. IAP API
 Ensure the IAP API is enabled in your project
 
 ## 🚀 Usage
@@ -134,9 +162,11 @@ gcloud services enable iap.googleapis.com
 
 ## 📚 References
 
-- [GitHub Issue #847](https://github.com/loft-sh/devpod/issues/847) - Original feature request
+- **Repository**: https://github.com/badal-io/devpod-provider-gcloud
+- [GitHub Issue #847](https://github.com/loft-sh/devpod/issues/847) - Original feature request (upstream)
 - [GCP IAP Documentation](https://cloud.google.com/iap/docs/using-tcp-forwarding)
 - [Connect to Linux VMs using IAP](https://cloud.google.com/compute/docs/connect/ssh-using-iap)
+- [Cloud NAT Documentation](https://cloud.google.com/nat/docs/overview)
 
 ## 🎉 Result
 
