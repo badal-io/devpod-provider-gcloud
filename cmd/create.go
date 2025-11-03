@@ -50,6 +50,14 @@ func (cmd *CreateCmd) Run(ctx context.Context, options *options.Options, log log
 	}
 	defer client.Close()
 
+	// Check Cloud NAT configuration if using private IP (IAP)
+	if !options.PublicIP {
+		err = checkCloudNATConfiguration(ctx, client, options)
+		if err != nil {
+			return err
+		}
+	}
+
 	instance, err := buildInstance(options)
 	if err != nil {
 		return err
@@ -259,6 +267,86 @@ func getMaintenancePolicy(machineType string) string {
 	}
 
 	return "MIGRATE"
+}
+
+// checkCloudNATConfiguration verifies that Cloud NAT is configured for the subnet when using private IPs
+func checkCloudNATConfiguration(ctx context.Context, client *gcloud.Client, options *options.Options) error {
+	// Extract region from zone (zone format: us-central1-a -> region: us-central1)
+	zone := options.Zone
+	region := zone[:strings.LastIndex(zone, "-")]
+
+	// Extract subnet name from the configured subnetwork
+	// If no subnetwork is specified, we can't check Cloud NAT
+	if options.Subnetwork == "" {
+		return fmt.Errorf("subnetwork must be specified when using private IP (PUBLIC_IP=false)")
+	}
+
+	// Parse the subnet name from various possible formats
+	subnetName := options.Subnetwork
+	// Handle full resource path: projects/{project}/regions/{region}/subnetworks/{name}
+	if strings.Contains(subnetName, "/subnetworks/") {
+		parts := strings.Split(subnetName, "/")
+		subnetName = parts[len(parts)-1]
+	}
+	// Handle {region}/{name} format
+	if strings.Contains(subnetName, "/") && !strings.Contains(subnetName, "projects/") {
+		parts := strings.Split(subnetName, "/")
+		subnetName = parts[len(parts)-1]
+	}
+
+	// Check if Cloud NAT is configured for this subnet
+	hasCloudNAT, err := client.CheckCloudNAT(ctx, region, subnetName)
+	if err != nil {
+		return fmt.Errorf("failed to check Cloud NAT configuration: %w", err)
+	}
+
+	if !hasCloudNAT {
+		return fmt.Errorf(`Cloud NAT is not configured for subnet '%s' in region '%s'.
+
+DevPod instances without public IPs require Cloud NAT for outbound internet access
+to download the DevPod agent and dependencies.
+
+To enable Cloud NAT, run the following commands:
+
+  # Create a Cloud Router (if one doesn't exist)
+  gcloud compute routers create devpod-nat-router \
+    --project=%s \
+    --region=%s \
+    --network=%s
+
+  # Create Cloud NAT configuration
+  gcloud compute routers nats create devpod-nat-config \
+    --router=devpod-nat-router \
+    --region=%s \
+    --nat-all-subnet-ip-ranges \
+    --auto-allocate-nat-external-ips \
+    --project=%s
+
+Alternatively, to configure Cloud NAT for a specific subnet only:
+
+  gcloud compute routers nats create devpod-nat-config \
+    --router=devpod-nat-router \
+    --region=%s \
+    --nat-custom-subnet-ip-ranges=%s \
+    --auto-allocate-nat-external-ips \
+    --project=%s
+
+For more information, see:
+https://cloud.google.com/nat/docs/gke-example#step_1_create_a_nat_configuration_using`,
+			subnetName,
+			region,
+			options.Project,
+			region,
+			options.Network,
+			region,
+			options.Project,
+			region,
+			subnetName,
+			options.Project,
+		)
+	}
+
+	return nil
 }
 
 // configureSSHForIAP creates an SSH config file with ProxyCommand for IAP tunneling

@@ -31,8 +31,14 @@ func NewClient(ctx context.Context, project, zone string, opts ...option.ClientO
 		return nil, err
 	}
 
+	routersClient, err := compute.NewRoutersRESTClient(ctx, opts...)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Client{
 		InstanceClient: instanceClient,
+		RoutersClient:  routersClient,
 		Project:        project,
 		Zone:           zone,
 	}, nil
@@ -40,6 +46,7 @@ func NewClient(ctx context.Context, project, zone string, opts ...option.ClientO
 
 type Client struct {
 	InstanceClient *compute.InstancesClient
+	RoutersClient  *compute.RoutersClient
 
 	Project string
 	Zone    string
@@ -223,5 +230,56 @@ func (c *Client) Close() error {
 		return err
 	}
 
+	err = c.RoutersClient.Close()
+	if err != nil {
+		return err
+	}
+
 	return nil
+}
+
+// CheckCloudNAT checks if Cloud NAT is configured for the given subnet in the region
+func (c *Client) CheckCloudNAT(ctx context.Context, region, subnetName string) (bool, error) {
+	// List all routers in the region
+	routersIterator := c.RoutersClient.List(ctx, &computepb.ListRoutersRequest{
+		Project: c.Project,
+		Region:  region,
+	})
+
+	// Check each router for NAT configuration on the specified subnet
+	for {
+		router, err := routersIterator.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return false, fmt.Errorf("error listing routers: %w", err)
+		}
+
+		// Check if this router has NAT configured
+		if router.Nats != nil && len(router.Nats) > 0 {
+			for _, nat := range router.Nats {
+				// Check if this NAT applies to all subnets or specifically to our subnet
+				if nat.SourceSubnetworkIpRangesToNat != nil {
+					sourceType := *nat.SourceSubnetworkIpRangesToNat
+
+					// ALL_SUBNETWORKS_ALL_IP_RANGES means Cloud NAT is enabled for all subnets
+					if sourceType == "ALL_SUBNETWORKS_ALL_IP_RANGES" {
+						return true, nil
+					}
+
+					// LIST_OF_SUBNETWORKS means we need to check if our subnet is in the list
+					if sourceType == "LIST_OF_SUBNETWORKS" && nat.Subnetworks != nil {
+						for _, subnet := range nat.Subnetworks {
+							if subnet.Name != nil && strings.Contains(*subnet.Name, subnetName) {
+								return true, nil
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return false, nil
 }
