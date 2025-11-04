@@ -10,8 +10,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/loft-sh/devpod-provider-gcloud/pkg/gcloud"
-	"github.com/loft-sh/devpod-provider-gcloud/pkg/options"
+	"github.com/badal-io/devpod-provider-gcloud/pkg/gcloud"
+	"github.com/badal-io/devpod-provider-gcloud/pkg/options"
 	"github.com/loft-sh/devpod/pkg/log"
 	"github.com/loft-sh/devpod/pkg/ssh"
 	"github.com/pkg/errors"

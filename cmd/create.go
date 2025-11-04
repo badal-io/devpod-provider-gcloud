@@ -11,9 +11,9 @@ import (
 	"strings"
 
 	"cloud.google.com/go/compute/apiv1/computepb"
-	"github.com/loft-sh/devpod-provider-gcloud/pkg/gcloud"
-	"github.com/loft-sh/devpod-provider-gcloud/pkg/options"
-	"github.com/loft-sh/devpod-provider-gcloud/pkg/ptr"
+	"github.com/badal-io/devpod-provider-gcloud/pkg/gcloud"
+	"github.com/badal-io/devpod-provider-gcloud/pkg/options"
+	"github.com/badal-io/devpod-provider-gcloud/pkg/ptr"
 	"github.com/loft-sh/devpod/pkg/log"
 	"github.com/loft-sh/devpod/pkg/ssh"
 	"github.com/pkg/errors"
