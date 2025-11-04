@@ -19,12 +19,12 @@ options:
   PROJECT:
     description: The project id to use.
     required: true
-    command: gcloud config list --quiet --verbosity=error --format "value(core.project)" 2>/dev/null || true
+    command: gcloud config list --quiet --verbosity=error --format 'value(core.project)' 2>/dev/null || true
   ZONE:
     description: The google cloud zone to create the VM in. E.g. europe-west1-d
     required: true
     command: |-
-      GCLOUD_ZONE=$(gcloud config list --quiet --verbosity=error --format "value(compute.zone)" 2>/dev/null || true)
+      GCLOUD_ZONE=$(gcloud config list --quiet --verbosity=error --format 'value(compute.zone)' 2>/dev/null || true)
       if [ -z "$GCLOUD_ZONE" ]; then
         echo "europe-west2-b"
       else
