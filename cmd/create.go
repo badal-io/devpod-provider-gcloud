@@ -59,10 +59,10 @@ func (cmd *CreateCmd) Run(ctx context.Context, options *options.Options, log log
 			return err
 		}
 
-		err = checkIAPFirewallRules(ctx, options, log)
+		err = ensureIAPFirewallRules(ctx, options, log)
 		if err != nil {
-			log.Warnf("IAP firewall check: %v", err)
-			log.Info("Continuing anyway - you may need to configure IAP firewall rules manually if connection fails")
+			log.Warnf("IAP firewall setup: %v", err)
+			log.Info("You may need to configure IAP firewall rules manually if connection fails")
 		}
 	}
 
@@ -398,14 +398,14 @@ Host %s
 	return nil
 }
 
-// checkIAPFirewallRules verifies or provides guidance on IAP firewall rules
-func checkIAPFirewallRules(ctx context.Context, options *options.Options, log log.Logger) error {
+// ensureIAPFirewallRules checks for and automatically creates IAP firewall rules if missing
+func ensureIAPFirewallRules(ctx context.Context, options *options.Options, log log.Logger) error {
 	log.Info("Checking IAP firewall configuration...")
 
 	// Check if IAP firewall rule exists using gcloud command
 	checkCmd := exec.CommandContext(ctx, "gcloud", "compute", "firewall-rules", "list",
 		"--project="+options.Project,
-		"--filter=name~devpod-allow-iap OR (sourceRanges:35.235.240.0/20 AND allowed:tcp:22)",
+		"--filter=sourceRanges:35.235.240.0/20 AND allowed:tcp:22",
 		"--format=value(name)")
 
 	output, err := checkCmd.Output()
@@ -414,44 +414,74 @@ func checkIAPFirewallRules(ctx context.Context, options *options.Options, log lo
 	}
 
 	if len(strings.TrimSpace(string(output))) > 0 {
-		log.Info("IAP firewall rules are configured")
+		log.Infof("IAP firewall rules are configured (%s)", strings.TrimSpace(string(output)))
 		return nil
 	}
 
-	// Firewall rule doesn't exist - provide instructions
-	return fmt.Errorf(`IAP firewall rule not found. DevPod needs a firewall rule to allow IAP SSH access.
+	// Firewall rule doesn't exist - create it automatically
+	log.Info("IAP firewall rule not found, creating automatically...")
 
-To create the firewall rule, run:
+	// Determine network name for the firewall rule
+	network := options.Network
+	if network == "" {
+		network = "default"
+	}
 
-  gcloud compute firewall-rules create devpod-allow-iap \\
-    --project=%s \\
-    --direction=INGRESS \\
-    --priority=1000 \\
-    --network=%s \\
-    --action=ALLOW \\
-    --rules=tcp:22 \\
-    --source-ranges=35.235.240.0/20 \\
-    --target-tags=%s
+	// Build create command
+	createArgs := []string{
+		"compute", "firewall-rules", "create", "devpod-allow-iap",
+		"--project=" + options.Project,
+		"--direction=INGRESS",
+		"--priority=1000",
+		"--network=" + network,
+		"--action=ALLOW",
+		"--rules=tcp:22",
+		"--source-ranges=35.235.240.0/20",
+		"--description=Allow IAP SSH access for DevPod instances",
+	}
 
-Or if not using tags:
+	// Add target tags if specified
+	if options.Tag != "" {
+		createArgs = append(createArgs, "--target-tags="+options.Tag)
+	}
 
-  gcloud compute firewall-rules create devpod-allow-iap \\
-    --project=%s \\
-    --direction=INGRESS \\
-    --priority=1000 \\
-    --network=%s \\
-    --action=ALLOW \\
-    --rules=tcp:22 \\
-    --source-ranges=35.235.240.0/20
+	createCmd := exec.CommandContext(ctx, "gcloud", createArgs...)
+	createCmd.Stdout = os.Stdout
+	createCmd.Stderr = os.Stderr
+
+	if err := createCmd.Run(); err != nil {
+		return fmt.Errorf(`failed to create IAP firewall rule automatically.
 
 The source range 35.235.240.0/20 is Google's IAP forwarding range.
-For more info: https://cloud.google.com/iap/docs/using-tcp-forwarding#create-firewall-rule`,
-		options.Project,
-		options.Network,
-		options.Tag,
-		options.Project,
-		options.Network,
-	)
+
+To create it manually, run:
+
+  gcloud compute firewall-rules create devpod-allow-iap \
+    --project=%s \
+    --direction=INGRESS \
+    --priority=1000 \
+    --network=%s \
+    --action=ALLOW \
+    --rules=tcp:22 \
+    --source-ranges=35.235.240.0/20%s
+
+For more info: https://cloud.google.com/iap/docs/using-tcp-forwarding#create-firewall-rule
+
+Error: %v`,
+			options.Project,
+			network,
+			func() string {
+				if options.Tag != "" {
+					return " \\\n    --target-tags=" + options.Tag
+				}
+				return ""
+			}(),
+			err,
+		)
+	}
+
+	log.Info("Successfully created IAP firewall rule 'devpod-allow-iap'")
+	return nil
 }
 
 // waitForInstanceReady waits for the instance to be fully ready including startup script completion
