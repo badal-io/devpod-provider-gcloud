@@ -5,10 +5,12 @@ import (
 	"encoding/base64"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"cloud.google.com/go/compute/apiv1/computepb"
 	"github.com/badal-io/devpod-provider-gcloud/pkg/gcloud"
@@ -50,11 +52,17 @@ func (cmd *CreateCmd) Run(ctx context.Context, options *options.Options, log log
 	}
 	defer client.Close()
 
-	// Check Cloud NAT configuration if using private IP (IAP)
+	// Check Cloud NAT and IAP configuration if using private IP (IAP)
 	if !options.PublicIP {
 		err = checkCloudNATConfiguration(ctx, client, options)
 		if err != nil {
 			return err
+		}
+
+		err = checkIAPFirewallRules(ctx, options, log)
+		if err != nil {
+			log.Warnf("IAP firewall check: %v", err)
+			log.Info("Continuing anyway - you may need to configure IAP firewall rules manually if connection fails")
 		}
 	}
 
@@ -70,6 +78,12 @@ func (cmd *CreateCmd) Run(ctx context.Context, options *options.Options, log log
 
 	// Configure SSH with ProxyCommand for IAP if not using public IP
 	if !options.PublicIP {
+		// Wait for instance to be fully ready and startup script to complete
+		log.Info("Waiting for instance to be fully ready...")
+		if err := waitForInstanceReady(ctx, client, options, log); err != nil {
+			return fmt.Errorf("waiting for instance ready: %w", err)
+		}
+
 		return configureSSHForIAP(options)
 	}
 
@@ -355,6 +369,7 @@ func configureSSHForIAP(options *options.Options) error {
 	sshConfigPath := filepath.Join(options.MachineFolder, "ssh_config")
 
 	// Create SSH config content with ProxyCommand for IAP
+	// Using ConnectTimeout and longer ServerAlive settings for IAP
 	sshConfig := fmt.Sprintf(`# DevPod GCP Provider IAP SSH Configuration
 Host %s
     HostName %s
@@ -363,8 +378,10 @@ Host %s
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
     ProxyCommand gcloud compute start-iap-tunnel %%h %%p --listen-on-stdin --project=%s --zone=%s --verbosity=warning
+    ConnectTimeout 60
     ServerAliveInterval 30
-    ServerAliveCountMax 3
+    ServerAliveCountMax 10
+    TCPKeepAlive yes
 `,
 		options.MachineID,            // Host
 		options.MachineID,            // HostName (will be resolved via ProxyCommand)
@@ -378,5 +395,115 @@ Host %s
 		return fmt.Errorf("write ssh config: %w", err)
 	}
 
+	return nil
+}
+
+// checkIAPFirewallRules verifies or provides guidance on IAP firewall rules
+func checkIAPFirewallRules(ctx context.Context, options *options.Options, log log.Logger) error {
+	log.Info("Checking IAP firewall configuration...")
+
+	// Check if IAP firewall rule exists using gcloud command
+	checkCmd := exec.CommandContext(ctx, "gcloud", "compute", "firewall-rules", "list",
+		"--project="+options.Project,
+		"--filter=name~devpod-allow-iap OR (sourceRanges:35.235.240.0/20 AND allowed:tcp:22)",
+		"--format=value(name)")
+
+	output, err := checkCmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to check firewall rules - ensure gcloud CLI is installed and configured")
+	}
+
+	if len(strings.TrimSpace(string(output))) > 0 {
+		log.Info("IAP firewall rules are configured")
+		return nil
+	}
+
+	// Firewall rule doesn't exist - provide instructions
+	return fmt.Errorf(`IAP firewall rule not found. DevPod needs a firewall rule to allow IAP SSH access.
+
+To create the firewall rule, run:
+
+  gcloud compute firewall-rules create devpod-allow-iap \\
+    --project=%s \\
+    --direction=INGRESS \\
+    --priority=1000 \\
+    --network=%s \\
+    --action=ALLOW \\
+    --rules=tcp:22 \\
+    --source-ranges=35.235.240.0/20 \\
+    --target-tags=%s
+
+Or if not using tags:
+
+  gcloud compute firewall-rules create devpod-allow-iap \\
+    --project=%s \\
+    --direction=INGRESS \\
+    --priority=1000 \\
+    --network=%s \\
+    --action=ALLOW \\
+    --rules=tcp:22 \\
+    --source-ranges=35.235.240.0/20
+
+The source range 35.235.240.0/20 is Google's IAP forwarding range.
+For more info: https://cloud.google.com/iap/docs/using-tcp-forwarding#create-firewall-rule`,
+		options.Project,
+		options.Network,
+		options.Tag,
+		options.Project,
+		options.Network,
+	)
+}
+
+// waitForInstanceReady waits for the instance to be fully ready including startup script completion
+func waitForInstanceReady(ctx context.Context, client *gcloud.Client, options *options.Options, log log.Logger) error {
+	// First, wait for instance to be in RUNNING state
+	maxAttempts := 60 // 5 minutes (60 * 5 seconds)
+	for i := 0; i < maxAttempts; i++ {
+		status, err := client.Status(ctx, options.MachineID)
+		if err != nil {
+			return fmt.Errorf("check instance status: %w", err)
+		}
+
+		if status == "Running" {
+			break
+		}
+
+		if i == maxAttempts-1 {
+			return fmt.Errorf("timeout waiting for instance to be running")
+		}
+
+		time.Sleep(5 * time.Second)
+	}
+
+	log.Info("Instance is running, waiting for startup script to complete...")
+
+	// Wait additional time for startup script to create devpod user
+	// The startup script typically takes 10-30 seconds
+	time.Sleep(30 * time.Second)
+
+	// Verify devpod user exists by attempting a quick SSH connection test
+	// This will fail if the user doesn't exist yet
+	sshConfigPath := filepath.Join(options.MachineFolder, "ssh_config")
+	testCmd := exec.CommandContext(ctx, "ssh",
+		"-F", sshConfigPath,
+		"-o", "ConnectTimeout=10",
+		options.MachineID,
+		"echo 'ready'")
+
+	// Try up to 6 times (1 minute total with 10s timeout each)
+	for i := 0; i < 6; i++ {
+		if err := testCmd.Run(); err == nil {
+			log.Info("Instance is fully ready for SSH connections")
+			return nil
+		}
+
+		if i < 5 {
+			log.Infof("Waiting for SSH to be ready (attempt %d/6)...", i+1)
+			time.Sleep(10 * time.Second)
+		}
+	}
+
+	// Don't fail here - continue anyway as the instance might still work
+	log.Warn("SSH readiness check timed out, but continuing anyway...")
 	return nil
 }
