@@ -80,22 +80,39 @@ func (cmd *CommandCmd) Run(ctx context.Context, options *options.Options, log lo
 
 		// Use system ssh command with our config file
 		// This leverages the ProxyCommand configured during create
-		sshArgs := []string{
-			"-F", sshConfigPath,  // Use our SSH config with ProxyCommand
-			options.MachineID,    // Host (configured in ssh_config)
-			command,              // Command to execute
+		// Add retry logic for IAP tunnel stability
+		maxRetries := 3
+		var lastErr error
+
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			sshArgs := []string{
+				"-F", sshConfigPath,  // Use our SSH config with ProxyCommand
+				"-o", "ConnectionAttempts=3",  // Multiple connection attempts per try
+				options.MachineID,    // Host (configured in ssh_config)
+				command,              // Command to execute
+			}
+
+			sshCmd := exec.CommandContext(ctx, "ssh", sshArgs...)
+			sshCmd.Stdin = os.Stdin
+			sshCmd.Stdout = os.Stdout
+			sshCmd.Stderr = os.Stderr
+
+			if err := sshCmd.Run(); err != nil {
+				lastErr = err
+				if attempt < maxRetries-1 {
+					// Retry with exponential backoff
+					backoffDuration := time.Duration((attempt+1)*2) * time.Second
+					log.Debugf("SSH command failed (attempt %d/%d), retrying in %v: %v", attempt+1, maxRetries, backoffDuration, err)
+					time.Sleep(backoffDuration)
+					continue
+				}
+			} else {
+				// Success!
+				return nil
+			}
 		}
 
-		sshCmd := exec.CommandContext(ctx, "ssh", sshArgs...)
-		sshCmd.Stdin = os.Stdin
-		sshCmd.Stdout = os.Stdout
-		sshCmd.Stderr = os.Stderr
-
-		if err := sshCmd.Run(); err != nil {
-			return fmt.Errorf("ssh via IAP ProxyCommand: %w", err)
-		}
-
-		return nil
+		return fmt.Errorf("ssh via IAP ProxyCommand failed after %d attempts: %w", maxRetries, lastErr)
 	}
 
 	// For instances with public IP, use standard SSH

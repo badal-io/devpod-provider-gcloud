@@ -369,7 +369,8 @@ func configureSSHForIAP(options *options.Options) error {
 	sshConfigPath := filepath.Join(options.MachineFolder, "ssh_config")
 
 	// Create SSH config content with ProxyCommand for IAP
-	// Using ConnectTimeout and longer ServerAlive settings for IAP
+	// Using extended timeouts for agent download which can take 2-5 minutes
+	// Increased ConnectTimeout from 60s to 300s (5 minutes) for agent injection
 	sshConfig := fmt.Sprintf(`# DevPod GCP Provider IAP SSH Configuration
 Host %s
     HostName %s
@@ -378,9 +379,9 @@ Host %s
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
     ProxyCommand gcloud compute start-iap-tunnel %%h %%p --listen-on-stdin --project=%s --zone=%s --verbosity=warning
-    ConnectTimeout 60
+    ConnectTimeout 300
     ServerAliveInterval 30
-    ServerAliveCountMax 10
+    ServerAliveCountMax 20
     TCPKeepAlive yes
 `,
 		options.MachineID,            // Host
@@ -508,32 +509,49 @@ func waitForInstanceReady(ctx context.Context, client *gcloud.Client, options *o
 	log.Info("Instance is running, waiting for startup script to complete...")
 
 	// Wait additional time for startup script to create devpod user
-	// The startup script typically takes 10-30 seconds
-	time.Sleep(30 * time.Second)
+	// Extended from 30s to 45s for slower instances
+	time.Sleep(45 * time.Second)
 
-	// Verify devpod user exists by attempting a quick SSH connection test
-	// This will fail if the user doesn't exist yet
+	// Verify devpod user exists by attempting SSH connection with exponential backoff
 	sshConfigPath := filepath.Join(options.MachineFolder, "ssh_config")
-	testCmd := exec.CommandContext(ctx, "ssh",
-		"-F", sshConfigPath,
-		"-o", "ConnectTimeout=10",
-		options.MachineID,
-		"echo 'ready'")
 
-	// Try up to 6 times (1 minute total with 10s timeout each)
-	for i := 0; i < 6; i++ {
+	// Try up to 12 times with exponential backoff (total ~4 minutes)
+	// This accommodates IAP tunnel initialization and user setup
+	maxRetries := 12
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Calculate backoff: 5s, 10s, 15s, 20s, 25s, 30s, then stay at 30s
+		backoff := time.Duration(min(5*(attempt+1), 30)) * time.Second
+
+		// Increased connection timeout from 10s to 30s for IAP tunnel stability
+		testCmd := exec.CommandContext(ctx, "ssh",
+			"-F", sshConfigPath,
+			"-o", "ConnectTimeout=30",
+			"-o", "ConnectionAttempts=3",
+			options.MachineID,
+			"echo 'ready'")
+
 		if err := testCmd.Run(); err == nil {
 			log.Info("Instance is fully ready for SSH connections")
 			return nil
 		}
 
-		if i < 5 {
-			log.Infof("Waiting for SSH to be ready (attempt %d/6)...", i+1)
-			time.Sleep(10 * time.Second)
+		if attempt < maxRetries-1 {
+			log.Infof("Waiting for SSH to be ready (attempt %d/%d, retry in %v)...", attempt+1, maxRetries, backoff)
+			time.Sleep(backoff)
 		}
 	}
 
-	// Don't fail here - continue anyway as the instance might still work
-	log.Warn("SSH readiness check timed out, but continuing anyway...")
+	// Extended waiting period - log warning but don't fail
+	// DevPod will retry connection during agent injection
+	log.Warn("SSH readiness check timed out after extended retries")
+	log.Info("DevPod agent injection will retry automatically - this is expected for slow network conditions")
 	return nil
+}
+
+// min returns the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
